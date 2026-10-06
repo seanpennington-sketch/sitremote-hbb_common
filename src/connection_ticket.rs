@@ -13,7 +13,7 @@ use lazy_static::lazy_static;
 use sodiumoxide::crypto::sign::{PublicKey, Signature, verify_detached};
 use std::sync::Mutex;
 use std::convert::TryInto;
-use base64::engine::{Engine, general_purpose::{URL_SAFE, STANDARD}};
+use base64::engine::{Engine, general_purpose::{URL_SAFE_NO_PAD, STANDARD}};
 
 /// Error types for ticket validation failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,7 +73,7 @@ pub fn verify_ticket(
     let payload_b64url = parts[1];
 
     // Decode base64url payload
-    let payload_json = URL_SAFE
+    let payload_json = URL_SAFE_NO_PAD
         .decode(payload_b64url)
         .map_err(|_| TicketError::InvalidSignature)?;
     let payload: serde_json::Value = serde_json::from_slice(&payload_json)
@@ -104,7 +104,7 @@ pub fn verify_ticket(
         .map_err(|_| TicketError::InvalidSignature)?;
     let expires_unix = expires.timestamp();
     let now_unix = now.as_secs() as i64;
-    if (now_unix - expires_unix).abs() > 30 {
+    if now_unix > expires_unix + 30 {
         return Err(TicketError::Expired);
     }
 
