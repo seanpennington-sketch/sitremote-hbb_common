@@ -45,6 +45,12 @@ lazy_static! {
     static ref TICKET_PUBLIC_KEY: Mutex<String> = Mutex::new(String::new());
 }
 
+const TICKET_EXPIRY_SKEW_SECONDS: i64 = 30;
+
+fn is_ticket_expired(now_unix: i64, expires_unix: i64) -> bool {
+    now_unix > expires_unix.saturating_add(TICKET_EXPIRY_SKEW_SECONDS)
+}
+
 /// Verify an Ed25519-signed connection ticket.
 ///
 /// The ticket format is: `1.<base64url(payload)>.<base64(signature)>`
@@ -96,7 +102,7 @@ pub fn verify_ticket(
         .as_str()
         .ok_or(TicketError::InvalidSignature)?;
 
-    // 3. Check expiry (30 second clock skew tolerance)
+    // 3. Reject tickets more than 30 seconds past expiry.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -104,7 +110,7 @@ pub fn verify_ticket(
         .map_err(|_| TicketError::InvalidSignature)?;
     let expires_unix = expires.timestamp();
     let now_unix = now.as_secs() as i64;
-    if (now_unix - expires_unix).abs() > 30 {
+    if is_ticket_expired(now_unix, expires_unix) {
         return Err(TicketError::Expired);
     }
 
@@ -167,4 +173,24 @@ pub fn set_ticket_public_key(base64_key: &str) {
     let mut key = TICKET_PUBLIC_KEY.lock().unwrap();
     *key = base64_key.to_owned();
     log::info!("Ticket verification public key updated (len={})", base64_key.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ticket_expired;
+
+    #[test]
+    fn ticket_expiring_in_future_is_valid() {
+        assert!(!is_ticket_expired(1_000, 1_090));
+    }
+
+    #[test]
+    fn ticket_within_expiry_skew_is_valid() {
+        assert!(!is_ticket_expired(1_030, 1_000));
+    }
+
+    #[test]
+    fn ticket_beyond_expiry_skew_is_expired() {
+        assert!(is_ticket_expired(1_031, 1_000));
+    }
 }
