@@ -9,11 +9,14 @@
 //! variable (base64-encoded 32-byte ed25519 secret key). The public key is
 //! derived and pushed to devices via the heartbeat response.
 
+use base64::engine::{
+    general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use lazy_static::lazy_static;
-use sodiumoxide::crypto::sign::{PublicKey, Signature, verify_detached};
-use std::sync::Mutex;
+use sodiumoxide::crypto::sign::{verify_detached, PublicKey, Signature};
 use std::convert::TryInto;
-use base64::engine::{Engine, general_purpose::{URL_SAFE, STANDARD}};
+use std::sync::Mutex;
 
 /// Error types for ticket validation failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +71,9 @@ pub fn verify_ticket(
     consumed_nonces: &mut Vec<String>,
 ) -> Result<(), TicketError> {
     // 1. Check ticket prefix
-    let ticket = ticket.strip_prefix("1.").ok_or(TicketError::InvalidSignature)?;
+    let ticket = ticket
+        .strip_prefix("1.")
+        .ok_or(TicketError::InvalidSignature)?;
 
     // 2. Parse payload and signature
     let parts: Vec<&str> = ticket.rsplitn(2, '.').collect();
@@ -79,11 +84,11 @@ pub fn verify_ticket(
     let payload_b64url = parts[1];
 
     // Decode base64url payload
-    let payload_json = URL_SAFE
+    let payload_json = URL_SAFE_NO_PAD
         .decode(payload_b64url)
         .map_err(|_| TicketError::InvalidSignature)?;
-    let payload: serde_json::Value = serde_json::from_slice(&payload_json)
-        .map_err(|_| TicketError::InvalidSignature)?;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&payload_json).map_err(|_| TicketError::InvalidSignature)?;
 
     // Extract fields
     let device_id = payload["device_id"]
@@ -125,7 +130,9 @@ pub fn verify_ticket(
         // Default-deny: no public key cached yet.
         // Devices must complete a successful heartbeat to receive the public key
         // before any connections are accepted.
-        log::warn!("No ticket public key cached — connection rejected (default-deny until heartbeat)");
+        log::warn!(
+            "No ticket public key cached — connection rejected (default-deny until heartbeat)"
+        );
         return Err(TicketError::InvalidSignature);
     }
     let pub_key = PublicKey(
@@ -165,19 +172,26 @@ pub fn serialize_ticket_for_signing(payload: &serde_json::Value) -> String {
     let issued_at = payload["issued_at"].as_str().unwrap_or("");
     let expires_at = payload["expires_at"].as_str().unwrap_or("");
     let nonce = payload["nonce"].as_str().unwrap_or("");
-    format!("{}.{}.{}.{}.{}.{}", version, device_id, token_id, issued_at, expires_at, nonce)
+    format!(
+        "{}.{}.{}.{}.{}.{}",
+        version, device_id, token_id, issued_at, expires_at, nonce
+    )
 }
 
 /// Update the cached verification public key (called from heartbeat response).
 pub fn set_ticket_public_key(base64_key: &str) {
     let mut key = TICKET_PUBLIC_KEY.lock().unwrap();
     *key = base64_key.to_owned();
-    log::info!("Ticket verification public key updated (len={})", base64_key.len());
+    log::info!(
+        "Ticket verification public key updated (len={})",
+        base64_key.len()
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_ticket_expired;
+    use super::{is_ticket_expired, verify_ticket, TicketError};
+    use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
 
     #[test]
     fn ticket_expiring_in_future_is_valid() {
@@ -192,5 +206,21 @@ mod tests {
     #[test]
     fn ticket_beyond_expiry_skew_is_expired() {
         assert!(is_ticket_expired(1_031, 1_000));
+    }
+
+    #[test]
+    fn unpadded_base64url_payload_is_parsed() {
+        let payload = serde_json::json!({
+            "device_id": "different-device",
+            "token_id": "test-token",
+            "issued_at": "2026-10-09T00:00:00.000Z",
+            "expires_at": "2999-10-09T00:01:30.000Z",
+            "nonce": "test-nonce",
+        });
+        let encoded = URL_SAFE_NO_PAD.encode(payload.to_string());
+        assert!(!encoded.contains('='));
+        let ticket = format!("1.{}.AA==", encoded);
+        let result = verify_ticket(&ticket, "expected-device", &mut Vec::new());
+        assert_eq!(result, Err(TicketError::DeviceMismatch));
     }
 }
