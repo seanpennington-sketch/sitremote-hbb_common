@@ -21,10 +21,18 @@ use std::sync::Mutex;
 /// Error types for ticket validation failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TicketError {
+    /// Ticket framing, payload encoding, JSON, fields, or timestamps are malformed.
+    MalformedEncoding,
     /// Ticket has expired (issued_at or expires_at outside tolerance).
     Expired,
     /// Ticket device_id doesn't match the host device.
     DeviceMismatch,
+    /// No verification key is available in this process.
+    MissingPublicKey,
+    /// The cached public key is not a valid Ed25519 public key.
+    InvalidPublicKeyEncoding,
+    /// The signature is not valid standard Base64 Ed25519 signature bytes.
+    InvalidSignatureEncoding,
     /// Ed25519 signature verification failed.
     InvalidSignature,
     /// Ticket was already used (nonce replay).
@@ -34,8 +42,12 @@ pub enum TicketError {
 impl std::fmt::Display for TicketError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TicketError::MalformedEncoding => write!(f, "malformed encoding"),
             TicketError::Expired => write!(f, "ticket expired"),
             TicketError::DeviceMismatch => write!(f, "device mismatch"),
+            TicketError::MissingPublicKey => write!(f, "missing public key"),
+            TicketError::InvalidPublicKeyEncoding => write!(f, "invalid public key encoding"),
+            TicketError::InvalidSignatureEncoding => write!(f, "invalid signature encoding"),
             TicketError::InvalidSignature => write!(f, "invalid signature"),
             TicketError::Replayed => write!(f, "ticket replayed"),
         }
@@ -73,12 +85,12 @@ pub fn verify_ticket(
     // 1. Check ticket prefix
     let ticket = ticket
         .strip_prefix("1.")
-        .ok_or(TicketError::InvalidSignature)?;
+        .ok_or(TicketError::MalformedEncoding)?;
 
     // 2. Parse payload and signature
     let parts: Vec<&str> = ticket.rsplitn(2, '.').collect();
     if parts.len() != 2 {
-        return Err(TicketError::InvalidSignature);
+        return Err(TicketError::MalformedEncoding);
     }
     let signature_b64 = parts[0];
     let payload_b64url = parts[1];
@@ -86,33 +98,33 @@ pub fn verify_ticket(
     // Decode base64url payload
     let payload_json = URL_SAFE_NO_PAD
         .decode(payload_b64url)
-        .map_err(|_| TicketError::InvalidSignature)?;
+        .map_err(|_| TicketError::MalformedEncoding)?;
     let payload: serde_json::Value =
-        serde_json::from_slice(&payload_json).map_err(|_| TicketError::InvalidSignature)?;
+        serde_json::from_slice(&payload_json).map_err(|_| TicketError::MalformedEncoding)?;
 
     // Extract fields
     let device_id = payload["device_id"]
         .as_str()
-        .ok_or(TicketError::InvalidSignature)?;
+        .ok_or(TicketError::MalformedEncoding)?;
     let _token_id = payload["token_id"]
         .as_str()
-        .ok_or(TicketError::InvalidSignature)?;
+        .ok_or(TicketError::MalformedEncoding)?;
     let _issued_at = payload["issued_at"]
         .as_str()
-        .ok_or(TicketError::InvalidSignature)?;
+        .ok_or(TicketError::MalformedEncoding)?;
     let expires_at = payload["expires_at"]
         .as_str()
-        .ok_or(TicketError::InvalidSignature)?;
+        .ok_or(TicketError::MalformedEncoding)?;
     let nonce = payload["nonce"]
         .as_str()
-        .ok_or(TicketError::InvalidSignature)?;
+        .ok_or(TicketError::MalformedEncoding)?;
 
     // 3. Reject tickets more than 30 seconds past expiry.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let expires = chrono::DateTime::parse_from_rfc3339(expires_at)
-        .map_err(|_| TicketError::InvalidSignature)?;
+        .map_err(|_| TicketError::MalformedEncoding)?;
     let expires_unix = expires.timestamp();
     let now_unix = now.as_secs() as i64;
     if is_ticket_expired(now_unix, expires_unix) {
@@ -133,22 +145,22 @@ pub fn verify_ticket(
         log::warn!(
             "No ticket public key cached — connection rejected (default-deny until heartbeat)"
         );
-        return Err(TicketError::InvalidSignature);
+        return Err(TicketError::MissingPublicKey);
     }
     let pub_key = PublicKey(
         STANDARD
             .decode(&pub_key_str)
-            .map_err(|_| TicketError::InvalidSignature)?
+            .map_err(|_| TicketError::InvalidPublicKeyEncoding)?
             .try_into()
-            .map_err(|_| TicketError::InvalidSignature)?,
+            .map_err(|_| TicketError::InvalidPublicKeyEncoding)?,
     );
     let message = serialize_ticket_for_signing(&payload);
     let signature_bytes = STANDARD
         .decode(signature_b64)
-        .map_err(|_| TicketError::InvalidSignature)?;
+        .map_err(|_| TicketError::InvalidSignatureEncoding)?;
     let sig_bytes: [u8; 64] = signature_bytes
         .try_into()
-        .map_err(|_| TicketError::InvalidSignature)?;
+        .map_err(|_| TicketError::InvalidSignatureEncoding)?;
     let signature = Signature::new(sig_bytes);
     if !verify_detached(&signature, message.as_bytes(), &pub_key) {
         return Err(TicketError::InvalidSignature);
@@ -188,10 +200,40 @@ pub fn set_ticket_public_key(base64_key: &str) {
     );
 }
 
+/// Return whether this process has a cached ticket key and its encoded byte length.
+pub fn ticket_public_key_status() -> (bool, usize) {
+    let key = TICKET_PUBLIC_KEY.lock().unwrap();
+    (!key.is_empty(), key.len())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_ticket_expired, verify_ticket, TicketError};
-    use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+    use super::{
+        is_ticket_expired, serialize_ticket_for_signing, set_ticket_public_key, verify_ticket,
+        TicketError, TICKET_PUBLIC_KEY,
+    };
+    use base64::engine::{
+        general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+        Engine,
+    };
+    use sodiumoxide::crypto::sign::{keypair_from_seed, sign_detached, Seed};
+
+    fn portal_format_ticket(payload: &serde_json::Value, set_key: bool) -> String {
+        let seed = Seed([7_u8; 32]);
+        let (public_key, secret_key) = keypair_from_seed(&seed);
+        if set_key {
+            set_ticket_public_key(&STANDARD.encode(public_key.0));
+        }
+        let signature = sign_detached(
+            serialize_ticket_for_signing(payload).as_bytes(),
+            &secret_key,
+        );
+        format!(
+            "1.{}.{}",
+            URL_SAFE_NO_PAD.encode(payload.to_string()),
+            STANDARD.encode(signature.as_ref())
+        )
+    }
 
     #[test]
     fn ticket_expiring_in_future_is_valid() {
@@ -222,5 +264,97 @@ mod tests {
         let ticket = format!("1.{}.AA==", encoded);
         let result = verify_ticket(&ticket, "expected-device", &mut Vec::new());
         assert_eq!(result, Err(TicketError::DeviceMismatch));
+    }
+
+    #[test]
+    fn portal_format_ticket_verification_categories_are_deterministic() {
+        let payload = serde_json::json!({
+            "device_id": "expected-device",
+            "token_id": "fixed-test-token",
+            "issued_at": "2026-10-09T00:00:00.000Z",
+            "expires_at": "2999-10-09T00:01:30.000Z",
+            "nonce": "fixed-test-nonce",
+        });
+        let ticket = portal_format_ticket(&payload, true);
+        let mut consumed = Vec::new();
+        assert_eq!(
+            verify_ticket(&ticket, "expected-device", &mut consumed),
+            Ok(())
+        );
+        assert_eq!(
+            verify_ticket(&ticket, "expected-device", &mut consumed),
+            Err(TicketError::Replayed)
+        );
+        assert_eq!(
+            verify_ticket(&ticket, "different-device", &mut Vec::new()),
+            Err(TicketError::DeviceMismatch)
+        );
+
+        let mut signature_mutation = ticket.into_bytes();
+        let last = signature_mutation.len() - 3;
+        signature_mutation[last] = if signature_mutation[last] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        assert_eq!(
+            verify_ticket(
+                &String::from_utf8(signature_mutation).unwrap(),
+                "expected-device",
+                &mut Vec::new()
+            ),
+            Err(TicketError::InvalidSignature)
+        );
+
+        set_ticket_public_key("invalid-key");
+        assert_eq!(
+            verify_ticket(
+                &portal_format_ticket(&payload, false),
+                "expected-device",
+                &mut Vec::new()
+            ),
+            Err(TicketError::InvalidPublicKeyEncoding)
+        );
+        let seed = Seed([7_u8; 32]);
+        let (public_key, _) = keypair_from_seed(&seed);
+        set_ticket_public_key(&STANDARD.encode(public_key.0));
+        let malformed_signature = format!(
+            "1.{}.not-base64!",
+            URL_SAFE_NO_PAD.encode(payload.to_string())
+        );
+        assert_eq!(
+            verify_ticket(&malformed_signature, "expected-device", &mut Vec::new()),
+            Err(TicketError::InvalidSignatureEncoding)
+        );
+        assert_eq!(
+            verify_ticket("1.not-a-ticket", "expected-device", &mut Vec::new()),
+            Err(TicketError::MalformedEncoding)
+        );
+
+        let expired_payload = serde_json::json!({
+            "device_id": "expected-device",
+            "token_id": "fixed-expired-token",
+            "issued_at": "2000-01-01T00:00:00.000Z",
+            "expires_at": "2000-01-01T00:01:30.000Z",
+            "nonce": "fixed-expired-nonce",
+        });
+        assert_eq!(
+            verify_ticket(
+                &portal_format_ticket(&expired_payload, true),
+                "expected-device",
+                &mut Vec::new()
+            ),
+            Err(TicketError::Expired)
+        );
+
+        *TICKET_PUBLIC_KEY.lock().unwrap() = String::new();
+        assert_eq!(
+            verify_ticket(
+                &portal_format_ticket(&payload, false),
+                "expected-device",
+                &mut Vec::new()
+            ),
+            Err(TicketError::MissingPublicKey)
+        );
     }
 }
